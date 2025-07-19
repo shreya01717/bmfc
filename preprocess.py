@@ -14,7 +14,7 @@ from antropy import hjorth_params, higuchi_fd
 
 # === CONFIGURATION ===
 SAMPLE_RATE = 256
-WINDOW_SEC = 4
+WINDOW_SEC = 4  # Reduced to 2s to handle short recordings
 WINDOW_SIZE = SAMPLE_RATE * WINDOW_SEC
 OVERLAP = 0.75
 STEP_SIZE = int(WINDOW_SIZE * (1 - OVERLAP))
@@ -31,7 +31,7 @@ BANDS = {
 
 # === ICA CLEANING ===
 def apply_ica(data):
-    info = create_info(CHANNELS, SAMPLE_RATE, ch_types='eeg')
+    info = create_info(CHANNELS[:data.shape[0]], SAMPLE_RATE, ch_types='eeg')
     raw = RawArray(data, info, verbose=False)
     raw.filter(1.0, 45.0, fir_design='firwin', verbose=False)
     raw.notch_filter(50.0, verbose=False)
@@ -41,7 +41,8 @@ def apply_ica(data):
         ica = ICA(n_components=min(15, raw.info['nchan'] - 1), random_state=97, max_iter='auto', verbose=False)
         ica.fit(raw)
         return ica.apply(raw, verbose=False).get_data()
-    except:
+    except Exception as e:
+        print(f"⚠️ ICA failed: {e}")
         return raw.get_data()
 
 # === GFT FEATURES ===
@@ -96,7 +97,7 @@ def segment_eeg(eeg_data, subject_id, label):
         subject_ids.append(subject_id)
     return handcrafted_feats, labels, subject_ids
 
-# === FILENAME-BASED LABELING ===
+# === LABEL INFERENCE ===
 def infer_label_from_filename(filename):
     name = filename.upper()
     if "MDD" in name:
@@ -106,19 +107,31 @@ def infer_label_from_filename(filename):
     else:
         return None, None
 
-# === PROCESS SINGLE EDF ===
+# === PROCESS SINGLE FILE ===
 def process_edf_file(filepath, label, subject_id):
     try:
         raw = mne.io.read_raw_edf(filepath, preload=True, verbose=False)
         raw.pick_types(eeg=True)
+        print(f"📐 Channel names in {os.path.basename(filepath)}: {raw.ch_names}")
         raw.resample(SAMPLE_RATE)
+
         data = raw.get_data()
+        print(f"📐 Raw shape: {data.shape}")
+
         if data.shape[0] > len(CHANNELS):
             data = data[:len(CHANNELS)]
+
+        if data.shape[1] < WINDOW_SIZE:
+            print(f"⚠️ Skipping {filepath} — not enough data for 1 window ({data.shape[1]} samples)")
+            return [], [], []
+
         cleaned = apply_ica(data)
+        print(f"🧼 Cleaned shape: {cleaned.shape}")
+
         return segment_eeg(cleaned, subject_id, label)
+
     except Exception as e:
-        print(f"⚠️ Skipping {filepath} due to error: {e}")
+        print(f"❌ Failed to process {filepath}: {e}")
         return [], [], []
 
 # === PROCESS DATASET ===
@@ -128,18 +141,22 @@ def process_edf_dataset(root_dir):
                  for f in fs if f.lower().endswith('.edf') and 'ec' in f.lower()]
     edf_files.sort()
 
+    print(f"📂 Found {len(edf_files)} EC files.")
+
     for idx, file in enumerate(edf_files):
         label, subj_id = infer_label_from_filename(os.path.basename(file))
         if label is None:
             print(f"⚠️ Skipping {file} (no label)")
             continue
 
-        print(f"[{idx+1}/{len(edf_files)}] Processing {os.path.basename(file)} - Label: {label}")
+        print(f"\n[{idx+1}/{len(edf_files)}] Processing {os.path.basename(file)} - Label: {label}")
         X, y, ids = process_edf_file(file, label, subj_id)
-        if X:
+        if len(X) > 0:
             X_all.extend(X)
             y_all.extend(y)
             ids_all.extend(ids)
+        else:
+            print(f"⚠️ No usable segments extracted from {file}")
 
     return np.array(X_all), np.array(y_all), np.array(ids_all)
 
@@ -157,13 +174,15 @@ if __name__ == "__main__":
     data_dir = "files"
     os.makedirs("processed_data", exist_ok=True)
 
-    print("\n=== Processing EC EDF Files ===")
+    print("\n=== 🔍 Processing EC EDF Files ===")
     X_combined, y, subj_ids = process_edf_dataset(data_dir)
 
-    X_norm = normalize_per_subject(X_combined, subj_ids)
-
-    np.save("processed_data/X_EC_enhanced.npy", X_norm)
-    np.save("processed_data/y_EC.npy", y)
-    np.save("processed_data/subject_ids_EC.npy", subj_ids)
-
-    print("✅ Saved: X_EC_enhanced.npy, y_EC.npy, subject_ids_EC.npy")
+    print(f"\n📊 Extracted total segments: {len(y)}")
+    if len(y) == 0:
+        print("❌ No usable data found. Please verify EDF file contents and window size.")
+    else:
+        X_norm = normalize_per_subject(X_combined, subj_ids)
+        np.save("processed_data/X_EC_enhanced.npy", X_norm)
+        np.save("processed_data/y_EC.npy", y)
+        np.save("processed_data/subject_ids_EC.npy", subj_ids)
+        print("✅ Saved: X_EC_enhanced.npy, y_EC.npy, subject_ids_EC.npy")
